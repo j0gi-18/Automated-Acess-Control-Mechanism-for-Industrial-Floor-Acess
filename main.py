@@ -1,8 +1,9 @@
 import cv2
 import numpy as np
 import tensorflow as tf
-import mediapipe as mp
-from sklearn.ensemble import RandomForestClassifier
+from sklearn.svm import SVC
+from sklearn.neighbors import KNeighborsClassifier
+from sklearn.linear_model import LogisticRegression
 import joblib
 import datetime as dt
 import pandas as pd
@@ -10,7 +11,10 @@ import paho.mqtt.client as mqtt
 import time
 import base64
 import os
-
+import mediapipe as mp
+import warnings
+import wiringpi
+from wiringpi import GPIO
 
 mp_solutions = mp.solutions
 
@@ -24,16 +28,17 @@ def load_frozen_graph(pb_file_path):
         tf.import_graph_def(graph_def, name="")
     return graph
 
-graph = load_frozen_graph('/Users/sagarkumbhar/Documents/TLC_Polymers_Ltd./New Algo/MobileFaceNet_9925_9680.pb')
+graph = load_frozen_graph('/root/Documents/face_recognition/New Algo/MobileFaceNet_9925_9680.pb')
 input_tensor = graph.get_tensor_by_name("input:0")
 output_tensor = graph.get_tensor_by_name("embeddings:0")
 
 sess = tf.compat.v1.Session(graph=graph)
 
-face_detection = mp_solutions.face_detection.FaceDetection(min_detection_confidence=0.4)
+face_detection = mp_solutions.face_detection.FaceDetection(model_selection= 0, min_detection_confidence=0.9)
 
-# Load pre-trained Random Forest classifier
-rf_classifier = joblib.load('/Users/sagarkumbhar/Documents/TLC_Polymers_Ltd./randomforest.joblib')
+# pre-trained Random Forest classifier
+rf_classifier = joblib.load('/root/Documents/face_recognition/Final/svm_final.joblib')
+
 mp_draw = mp.solutions.drawing_utils
 
 # Preprocessing function
@@ -43,7 +48,7 @@ def preprocess_image(image):
     image = cv2.resize(image, (112, 112))
     image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
     image = np.expand_dims(image, axis=0)
-    image = image / 255.0  # Normalize the image
+    image = image / 255.0
     return image
 
 # Get face embedding function
@@ -53,20 +58,29 @@ def get_face_embedding(face_image):
     return embedding.flatten()
 
 # Recognize face function with confidence threshold
-def recognize_face(face_image, threshold=0.50):
+def recognize_face(face_image):
     embedding = get_face_embedding(face_image)
     probabilities = rf_classifier.predict_proba([embedding])[0]
     max_index = np.argmax(probabilities)
     max_probability = probabilities[max_index]
+    return max_index ,max_probability
 
-    if max_probability >= threshold:
-        return max_index, max_probability
-    else:
-        return None, None
+
+def label_names(class_in):
+  try:
+    filename = '/root/Documents/face_recognition/Final/labels.txt'
+    with open(filename, 'r') as file:
+      lines = file.readlines()
+      if 0 <= class_in < len(lines):
+          return lines[class_in].strip()
+      else:
+          return None
+  except FileNotFoundError:
+    print("File not found.")
+    return None
 
 class FaceRecognition:
     def __init__(self, broker_address="localhost"):
-        self.label_names = self.load_label_names('/Users/sagarkumbhar/Documents/TLC_Polymers_Ltd./Final/labels.txt')
         self.attendance_records = []
         self.predicted_names = []
         self.broker_address = broker_address
@@ -79,13 +93,7 @@ class FaceRecognition:
         wiringpi.wiringPiSetup()
         wiringpi.pinMode(2, GPIO.OUTPUT)
         wiringpi.pinMode(4, GPIO.INPUT)
-        wiringpi.digitalWrite(2, GPIO.HIGH)
-        wiringpi.pullUpDnControl(4, 2)
-
-    def load_label_names(self, filepath):
-        with open(filepath, 'r') as f:
-            return [line.strip() for line in f.readlines()]
-
+        
     def recognize_faces(self, frame):
         current_time = dt.datetime.now().strftime('%I:%M:%S %p')
         rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
@@ -107,16 +115,20 @@ class FaceRecognition:
                 
                 prediction, probability = recognize_face(face_image)
                 
-                if prediction is not None:
-                    predicted_name = self.label_names[int(prediction)]
+                # confidence thresold
+                if prediction is not None and probability >= 0.50:
+                    predicted_name = label_names(int(prediction))
+
                     current_date = dt.datetime.now().strftime('%d-%m-%y')
                     if not any(record['Name'] == predicted_name for record in self.attendance_records):
                         self.attendance_records.append({'Name': predicted_name, 'Date': current_date, 'Time': current_time})
                     cv2.putText(frame, predicted_name, (x, y - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (36, 255, 12), 2)
                     cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 255, 0), 2)
                     self.predicted_names = [predicted_name]
+                    break  # Break after processing the first face with high confidence
                 else:
                     cv2.putText(frame, "Unknown Person", (x, y - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 0, 255), 2)
+                    #cv2.putText(frame, "Unknown Person", (x, y-10), cv2.FONT_HERSHEY_SIMPLEX, 0>
                     cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 0, 255), 2)
                     self.predicted_names = ["Unknown Person"]
                     
@@ -126,10 +138,11 @@ class FaceRecognition:
 
     def run(self):
         button_status = wiringpi.digitalRead(4)
-        cap = cv2.VideoCapture(0)
+        cap = cv2.VideoCapture(1)
         self.msg_client.connect(self.broker_address)
         self.img_client.connect(self.broker_address, 1883, 60)
-
+        wiringpi.digitalWrite(2, GPIO.HIGH)  # uncomment to operate door lock (puts in closed state)
+        
         while True:
             ret, frame = cap.read()
             if not ret:
@@ -140,27 +153,43 @@ class FaceRecognition:
             self.recognize_faces(frame)
             try:
                 if not self.predicted_names or "Unknown Person" in self.predicted_names:
+                    # wiringpi.digitalWrite(2, GPIO.HIGH)  # uncomment to operate door lock (puts in closed state)
                     message = "Person unrecognised, Entry denied"
                     self.msg_client.publish(self.message_topic, message)
+                    filename = f"webcam_capture_{int(time.time())}.jpg"
+                    cv2.imwrite(filename, frame)
+                    with open(filename, "rb") as image_file:
+                        image_data = base64.b64encode(image_file.read())
+                        self.img_client.publish(self.image_topic, image_data)
+                        os.remove(filename)
+
+                    perm = input("Press 'a' to allow person")
+                    if perm == "a":
+                        print("person allowed !")
+                        wiringpi.digitalWrite(2, GPIO.LOW)  # uncomment to operate door lock (puts in closed state)
+                        time.sleep(2)
+                        wiringpi.digitalWrite(2, GPIO.HIGH)  # uncomment to operate door lock (puts in open state)
                 else:
                     predicted_name = self.predicted_names[0]
                     message = f"Welcome {predicted_name}! to Tlc Polymers Ltd."
                     self.msg_client.publish(self.message_topic, message)
-                    wiringpi.digitalWrite(2, GPIO.LOW)
+                    wiringpi.digitalWrite(2, GPIO.LOW)  # uncomment to operate door lock (puts in open state)
             except KeyboardInterrupt:
                 print("Exiting")
-        
+
             cv2.imshow('Face Recognition', frame)
             if key == ord('q'):
                 break
-
-            if button_status == 0:
-                filename = f"webcam_capture_{int(time.time())}.jpg"
-                cv2.imwrite(filename, frame)
-                with open(filename, "rb") as image_file:
-                    image_data = base64.b64encode(image_file.read())
-                    self.img_client.publish(self.image_topic, image_data)
-                    os.remove(filename)
+                
+            # Uncomment to activate push button to click photos in case of False Negatives
+            #if key == ord('p'):
+            #if button_status == 0:
+            #    filename = f"webcam_capture_{int(time.time())}.jpg"
+            #    cv2.imwrite(filename, frame)
+            #    with open(filename, "rb") as image_file:
+            #        image_data = base64.b64encode(image_file.read())
+            #        self.img_client.publish(self.image_topic, image_data)
+            #        os.remove(filename)
 
         cap.release()
         self.msg_client.disconnect()
